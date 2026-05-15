@@ -1,5 +1,7 @@
 /**
  * Orchestrator — central hub: classify → policy check → route → execute → audit → deliver.
+ *
+ * Emits events for TUI reactivity (no UI logic here).
  */
 
 import type { AgentRole, TaskType, BudgetMode } from '../types.js';
@@ -14,16 +16,31 @@ import { getBudgetState, setBudgetMode } from '../policy/budget-enforcer.js';
 import { readAuditEntries, formatAuditReport } from '../audit/reporter.js';
 import { formatBudgetReport } from '../policy/budget-enforcer.js';
 import { AGENT_CONFIGS } from '../config/models.js';
+import { EventEmitter } from 'node:events';
+
+// ─── Event Types ────────────────────────────────────────────────────
+
+export type OrchestratorEventMap = {
+  'status': ['idle' | 'routing' | 'executing' | 'validating' | 'escalating'];
+  'agent:start': [{ role: AgentRole; model: string; emoji: string; displayName: string }];
+  'agent:done': [{ role: AgentRole; success: boolean; durationMs: number }];
+  'budget:update': [{ mode: BudgetMode; todaySpendUsd: number }];
+};
+
+// ─── Options ────────────────────────────────────────────────────────
 
 export interface OrchestratorOptions {
   workspaceDir: string;
   dryRun?: boolean;
 }
 
-export class Orchestrator {
+// ─── Class ──────────────────────────────────────────────────────────
+
+export class Orchestrator extends EventEmitter<OrchestratorEventMap> {
   private workspaceDir: string;
 
   constructor(options: OrchestratorOptions) {
+    super();
     this.workspaceDir = options.workspaceDir;
   }
 
@@ -39,16 +56,19 @@ export class Orchestrator {
     const budgetState = getBudgetState();
 
     // Route
+    this.emit('status', 'routing');
     const routing = routeTask(prompt, budgetState.mode, options.explicitTaskType, options.explicitAgent);
 
     // Dry-run check
     if (options.dryRun || process.env.DRY_RUN === 'true') {
+      this.emit('status', 'idle');
       return formatDryRun(routing, prompt);
     }
 
     // Policy: check if model is allowed
     const modelCheck = checkModelGuardrail(routing.modelId, budgetState.mode);
     if (!modelCheck.allowed) {
+      this.emit('status', 'idle');
       return `❌ Policy blocked: ${modelCheck.reason}`;
     }
 
@@ -57,11 +77,26 @@ export class Orchestrator {
     const stopConfig = getStopConfig(budgetState.mode, agentConfig.maxSteps);
 
     // Execute
+    this.emit('status', 'executing');
+    this.emit('agent:start', {
+      role: routing.agentRole,
+      model: routing.modelId,
+      emoji: agentConfig.emoji,
+      displayName: agentConfig.displayName,
+    });
+
     const header = `${agentConfig.emoji} [${agentConfig.displayName} | ${routing.modelId}]`;
     let result = await executeAgentCall(routing, prompt, stopConfig, this.workspaceDir);
 
+    this.emit('agent:done', {
+      role: routing.agentRole,
+      success: result.success,
+      durationMs: result.durationMs,
+    });
+
     // Handle failure → escalation (rules-based)
     if (!result.success && routing.agentRole !== 'heavy_coder' && routing.agentRole !== 'judge') {
+      this.emit('status', 'escalating');
       const escalation = shouldEscalate(
         'validation_failed_after_retry',
         routing.agentRole,
@@ -74,6 +109,13 @@ export class Orchestrator {
         const escalationConfig = getAgentConfig(escalation.to);
         const escalationHeader = `${escalationConfig.emoji} [${escalationConfig.displayName} | ${escalationRouting.modelId}] (escalated from ${agentConfig.displayName})`;
 
+        this.emit('agent:start', {
+          role: escalation.to,
+          model: escalationRouting.modelId,
+          emoji: escalationConfig.emoji,
+          displayName: escalationConfig.displayName,
+        });
+
         result = await executeAgentCall(
           escalationRouting,
           prompt,
@@ -81,13 +123,25 @@ export class Orchestrator {
           this.workspaceDir,
         );
 
+        this.emit('agent:done', {
+          role: escalation.to,
+          success: result.success,
+          durationMs: result.durationMs,
+        });
+
         if (!result.success) {
+          this.emit('status', 'idle');
           return `${escalationHeader}\n❌ [ESCALATION_FAILED] Both ${agentConfig.displayName} and ${escalationConfig.displayName} failed.\nError: ${result.error}`;
         }
 
+        this.emit('status', 'idle');
+        this.emit('budget:update', { mode: getBudgetState().mode, todaySpendUsd: getBudgetState().todaySpendUsd });
         return `${escalationHeader}\n${result.text}`;
       }
     }
+
+    this.emit('status', 'idle');
+    this.emit('budget:update', { mode: getBudgetState().mode, todaySpendUsd: getBudgetState().todaySpendUsd });
 
     if (!result.success) {
       return `${header}\n❌ Error: ${result.error}`;
@@ -107,6 +161,7 @@ export class Orchestrator {
         return `Invalid mode. Use: strict | balanced | max_quality`;
       }
       setBudgetMode(mode);
+      this.emit('budget:update', { mode, todaySpendUsd: getBudgetState().todaySpendUsd });
       return `✅ Budget mode set to: ${mode}`;
     }
     return formatBudgetReport();
@@ -125,3 +180,4 @@ export class Orchestrator {
     return ['Agent              │ Primary Model', '───────────────────┼──────────────────────────────', ...lines].join('\n');
   }
 }
+
