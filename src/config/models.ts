@@ -4,7 +4,7 @@
  * Config-driven: change models here, not in agent logic.
  */
 
-import type { ModelEntry, AgentModelConfig } from '../types.js';
+import type { ModelEntry, AgentModelConfig, AgentRole } from '../types.js';
 
 // ─── Model Catalog ──────────────────────────────────────────────────
 
